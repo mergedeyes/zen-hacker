@@ -1,0 +1,793 @@
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::Editor;
+use rustyline::{Context, Helper};
+use serde::{Deserialize, Serialize}; // Brings in the magic translation macros
+use std::collections::HashMap;
+use std::fs; // Brings in Rust's File System tools to read/write to your real hard drive
+use std::io::Write;
+
+#[derive(Serialize, Deserialize, Clone)]
+enum VfsNode {
+    File {
+        content: String,
+        owner: String,
+    },
+    Directory {
+        children: Vec<String>,
+        owner: String,
+    },
+}
+
+impl VfsNode {
+    // A centralized way to create files.
+    // Add future metadata (timestamps, permissions) right here!
+    fn new_file(content: String, owner: &str) -> Self {
+        VfsNode::File {
+            content,
+            owner: owner.to_string(),
+        }
+    }
+
+    // A centralized way to create directories.
+    fn new_dir(owner: &str) -> Self {
+        VfsNode::Directory {
+            children: Vec::new(),
+            owner: owner.to_string(),
+        }
+    }
+
+    fn owner(&self) -> &str {
+        match self {
+            VfsNode::File { owner, .. } => owner,
+            VfsNode::Directory { owner, .. } => owner,
+        }
+    }
+
+    // 2. The outsourced security check!
+    fn can_access(&self, current_user: &str) -> bool {
+        current_user == "root" || self.owner() == current_user
+    }
+}
+
+struct ZenHelper {
+    commands: Vec<&'static str>,
+    vfs_paths: Vec<String>,
+    cwd: String,
+}
+
+impl Completer for ZenHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let mut candidates = Vec::new();
+
+        // 1. Find where the current word starts (look for the last space before the cursor)
+        let word_start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
+        let word_to_complete = &line[word_start..pos];
+
+        // 2. Check if it matches a Command
+        for cmd in &self.commands {
+            if cmd.starts_with(word_to_complete) {
+                candidates.push(Pair {
+                    display: cmd.to_string(),
+                    replacement: cmd.to_string(),
+                });
+            }
+        }
+
+        // 3. Check for File/Directory paths (Relative and Absolute!)
+        let is_absolute = word_to_complete.starts_with('/');
+
+        // Invisibly build what the absolute path *would* be based on what they typed
+        let search_prefix = if is_absolute {
+            word_to_complete.to_string()
+        } else if self.cwd == "/" {
+            format!("/{}", word_to_complete)
+        } else {
+            format!("{}/{}", self.cwd, word_to_complete)
+        };
+
+        for path in &self.vfs_paths {
+            // If the dictionary path matches our search, and it's not JUST the current folder
+            if path.starts_with(&search_prefix) && path != &self.cwd {
+                // If they typed a relative path, we need to strip the absolute part off
+                // so `rustyline` doesn't print the whole absolute path onto the screen!
+                let replacement = if is_absolute {
+                    path.clone()
+                } else {
+                    let prefix_len = if self.cwd == "/" {
+                        1
+                    } else {
+                        self.cwd.len() + 1
+                    };
+                    if path.len() > prefix_len {
+                        path[prefix_len..].to_string()
+                    } else {
+                        continue;
+                    }
+                };
+
+                // Smart Folder Completion: Only autocomplete up to the next slash!
+                // If the path goes deeper (e.g. docs/secret.txt), we just autocomplete "docs/" first.
+                let final_replacement =
+                    if let Some(slash_idx) = replacement[word_to_complete.len()..].find('/') {
+                        replacement[..word_to_complete.len() + slash_idx + 1].to_string()
+                    } else {
+                        replacement
+                    };
+
+                // Add it to our candidates if it's not already there!
+                if !candidates
+                    .iter()
+                    .any(|c| c.replacement == final_replacement)
+                {
+                    candidates.push(Pair {
+                        display: final_replacement.clone(),
+                        replacement: final_replacement,
+                    });
+                }
+            }
+        }
+
+        Ok((word_start, candidates))
+    }
+}
+
+// We have to tell Rustyline we don't want to use these advanced features yet,
+// so we just give them empty implementations.
+impl Hinter for ZenHelper {
+    type Hint = String;
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+impl Highlighter for ZenHelper {}
+impl Validator for ZenHelper {}
+impl Helper for ZenHelper {}
+
+fn main() {
+    let mut input = String::new();
+    let mut cwd = String::from("/home/user");
+    let mut current_user = String::from("user");
+    let mut vfs: HashMap<String, VfsNode> =
+        if let Ok(saved_data) = fs::read_to_string("vfs_data.json") {
+            // 1. First, try to load it normally. If it works, great!
+            match serde_json::from_str(&saved_data) {
+                Ok(valid_vfs) => valid_vfs,
+                Err(_) => {
+                    println!("[SYSTEM] Outdated VFS format detected. Initiating data migration...");
+
+                    // 2. Load it as a generic JSON object so we can mutate it
+                    let mut raw_json: HashMap<String, serde_json::Value> =
+                        serde_json::from_str(&saved_data).unwrap();
+
+                    // 3. Loop through every single file/folder
+                    for (path, node) in raw_json.iter_mut() {
+                        // Determine the owner based on your logic!
+                        let owner = if path.starts_with("/home/user") {
+                            "user"
+                        } else {
+                            "root"
+                        };
+
+                        // Serde saves enums as {"File": {...}} or {"Directory": {...}}.
+                        // We need to reach inside and inject the "owner" key!
+                        if let Some(obj) = node.get_mut("File").and_then(|v| v.as_object_mut()) {
+                            if !obj.contains_key("owner") {
+                                obj.insert(
+                                    "owner".to_string(),
+                                    serde_json::Value::String(owner.to_string()),
+                                );
+                            }
+                        } else if let Some(obj) =
+                            node.get_mut("Directory").and_then(|v| v.as_object_mut())
+                        {
+                            if !obj.contains_key("owner") {
+                                obj.insert(
+                                    "owner".to_string(),
+                                    serde_json::Value::String(owner.to_string()),
+                                );
+                            }
+                        }
+                    }
+
+                    // 4. Convert it back to our strict Rust types
+                    let upgraded_vfs: HashMap<String, VfsNode> =
+                        serde_json::from_value(serde_json::to_value(&raw_json).unwrap()).unwrap();
+
+                    // 5. Save the patched file back to the hard drive instantly
+                    let patched_data = serde_json::to_string_pretty(&upgraded_vfs).unwrap();
+                    fs::write("vfs_data.json", patched_data).unwrap();
+
+                    println!("[SYSTEM] Migration complete. Booting...");
+                    upgraded_vfs
+                }
+            }
+        } else {
+            // DEFAULT BOOT (If no vfs_data.json exists at all)
+            let mut default_vfs: HashMap<String, VfsNode> = HashMap::new();
+
+            default_vfs.insert(
+                String::from("/"),
+                VfsNode::Directory {
+                    children: vec![String::from("home")],
+                    owner: String::from("root"),
+                },
+            );
+            default_vfs.insert(
+                String::from("/home"),
+                VfsNode::Directory {
+                    children: vec![String::from("user")],
+                    owner: String::from("root"),
+                },
+            );
+            default_vfs.insert(
+                String::from("/home/user"),
+                VfsNode::Directory {
+                    children: vec![],
+                    owner: String::from("user"),
+                },
+            );
+            default_vfs
+        };
+
+    let mut rl = Editor::new().unwrap();
+
+    // Attach our custom Tab-Completer!
+    let helper = ZenHelper {
+        commands: vec![
+            "cat", "cd", "clear", "cp", "echo", "exit", "grep", "help", "history", "ls", "mkdir",
+            "mv", "pwd", "rm", "sudo", "touch", "whoami",
+        ],
+        vfs_paths: Vec::new(),
+        cwd: String::new(),
+    };
+
+    rl.set_helper(Some(helper));
+
+    let mut history_list: Vec<String> = Vec::new();
+    // Attempt to load previous history
+    if let Ok(history_data) = std::fs::read_to_string(".zen_history") {
+        for line in history_data.lines() {
+            history_list.push(line.to_string());
+            let _ = rl.add_history_entry(line); // Give the arrow keys their memory back!
+        }
+    }
+
+    // Boot sequence: Source the .zenrc file FROM THE VFS!
+
+    // 1. Fetch and clone the text so we don't lock the dictionary!
+    let rc_content = if let Some(VfsNode::File { content, .. }) = vfs.get("/home/user/.zenrc") {
+        Some(content.clone())
+    } else {
+        None
+    };
+
+    // 2. Now we can safely execute the cloned text!
+    if let Some(rc_data) = rc_content {
+        for line in rc_data.lines() {
+            let clean_line = line.trim();
+            if !clean_line.is_empty() {
+                // Let .zenrc use pipes too!
+                let pipe_segments: Vec<&str> = clean_line.split('|').collect();
+                let mut current_pipe_data: Option<String> = None;
+
+                for segment in pipe_segments {
+                    let (_, output) = execute_command(
+                        segment.trim(),
+                        &mut cwd,
+                        &mut vfs,
+                        &history_list,
+                        &mut current_user,
+                        current_pipe_data,
+                    );
+                    current_pipe_data = output;
+                }
+
+                // Actually print the final result to the screen!
+                if let Some(final_text) = current_pipe_data {
+                    if !final_text.is_empty() {
+                        println!("{}", final_text);
+                    }
+                }
+            }
+        }
+    }
+    
+    loop {
+        if let Some(helper) = rl.helper_mut() {
+            helper.vfs_paths = vfs.keys().cloned().collect();
+            helper.cwd = cwd.clone();
+        }
+        // 1. Build the prompt string (preserving your awesome `~` logic!)
+        let prompt = if cwd.starts_with("/home/user") {
+            let new_prompt = cwd.replace("/home/user", "~");
+            format!("user@sim-os:{}$", new_prompt)
+        } else {
+            format!("user@sim-os:{}$ ", cwd)
+        };
+
+        // 2. Ask rustyline to print the prompt and wait for input
+        let line = match rl.readline(&prompt) {
+            Ok(line) => {
+                // Add it to rustyline's internal arrow-key memory!
+                let _ = rl.add_history_entry(line.as_str());
+                line // Hand the string out of the match block
+            }
+            Err(ReadlineError::Interrupted) => continue, // They pressed Ctrl-C
+            Err(ReadlineError::Eof) => break,            // They pressed Ctrl-D (Exit)
+            Err(err) => {
+                println!("Error: {:?}", err);
+                break;
+            }
+        };
+
+        // 3. Clean up the input
+        let clean_input = line.trim();
+        let history_input = clean_input.to_string();
+
+        // Ignore empty Enter presses
+        if history_input.is_empty() {
+            continue;
+        }
+
+        // Save the command to our custom history list for the `history` command!
+        history_list.push(history_input.clone());
+
+        // 4. Split the input into an Iterator
+
+        // 4. THE PIPELINE ENGINE! Split the input by '|'
+        let pipe_segments: Vec<&str> = history_input.split('|').collect();
+        let mut current_pipe_data: Option<String> = None;
+        let mut keep_running = true;
+
+        for segment in pipe_segments {
+            // Pass the output of the last command as the `stdin` of the current command!
+            let (should_continue, output) = execute_command(
+                segment.trim(),
+                &mut cwd,
+                &mut vfs,
+                &history_list,
+                &mut current_user,
+                current_pipe_data, 
+            );
+            
+            keep_running = should_continue;
+            current_pipe_data = output; // Save this command's output for the next one!
+
+            if !keep_running { break; }
+        }
+
+        // If the very last command in the pipe produced output, print it to the screen!
+        if let Some(final_text) = current_pipe_data {
+            if !final_text.is_empty() {
+                println!("{}", final_text);
+            }
+        }
+
+        if !keep_running {
+            break;
+        }
+
+        input.clear();
+    }
+
+    let json_data = serde_json::to_string_pretty(&vfs).unwrap();
+    let json_file = "vfs_data.json";
+    fs::write(json_file, json_data).unwrap();
+    // Save the History!
+    std::fs::write(".zen_history", history_list.join("\n")).unwrap();
+    println!("State and history saved. Stay zen!");
+}
+
+// Add `history: &Vec<String>` to the parameters!
+fn execute_command(
+    input: &str,
+    cwd: &mut String,
+    vfs: &mut HashMap<String, VfsNode>,
+    history: &Vec<String>,
+    current_user: &mut String,
+    stdin: Option<String>, // <--- NEW!
+) -> (bool, Option<String>) { // <--- NEW!
+    let mut input_parts = input.split_whitespace();
+    let mut stdout: Option<String> = None; // What we will return to the pipe!
+
+    if let Some(cmd) = input_parts.next() {
+        match cmd {
+            "cat" => {
+                if let Some(file_name) = input_parts.next() {
+                    let full_file_path = resolve_path(file_name, &cwd);
+
+                    if let Some(node) = vfs.get(&full_file_path) {
+                        if !node.can_access(current_user) {
+                            println!("cat: {}: Permission denied", file_name); // stderr
+                        } else {
+                            match node {
+                                VfsNode::Directory { .. } => println!("cat: '{}': Is a directory", file_name),
+                                VfsNode::File { content, .. } => stdout = Some(content.clone()), // stdout!
+                            }
+                        }
+                    } else {
+                        println!("cat: {}: No such file", file_name);
+                    }
+                } else if let Some(pipe_in) = stdin {
+                    stdout = Some(pipe_in); // cat can just pass the pipe through!
+                } else {
+                    println!("cat: missing operand");
+                }
+            }
+
+            "cd" => {
+                if let Some(path) = input_parts.next() {
+                    let full_target_path = resolve_path(path, &cwd);
+                    if let Some(node) = vfs.get(&full_target_path) {
+                        if !node.can_access(current_user) {
+                            println!("cd: {}: Permission denied", path);
+                        } else {
+                            match node {
+                                VfsNode::Directory { .. } => *cwd = full_target_path,
+                                VfsNode::File { .. } => println!("cd: {}: Not a directory", path),
+                            }
+                        }
+                    } else {
+                        println!("cd: {}: No such file or directory", path);
+                    }
+                } else {
+                    *cwd = "/home/user".to_string();
+                }
+            }
+
+            "clear" => {
+                print!("\x1B[2J\x1B[1;1H");
+                std::io::stdout().flush().unwrap();
+            }
+
+            "cp" => { /* ... existing cp logic remains identical ... */
+                let source_arg = input_parts.next();
+                let dest_arg = input_parts.next();
+                if let (Some(src), Some(dst)) = (source_arg, dest_arg) {
+                    let src_path = resolve_path(src, &cwd);
+                    let mut dst_path = resolve_path(dst, &cwd);
+                    if let Some(src_node) = vfs.get(&src_path) {
+                        if !src_node.can_access(current_user) {
+                            println!("cp: cannot read '{}': Permission denied", src);
+                        } else {
+                            let cloned_node = src_node.clone();
+                            if let Some(VfsNode::Directory { .. }) = vfs.get(&dst_path) {
+                                let file_name = src_path.rsplit_once('/').map(|(_, name)| name).unwrap_or(&src_path);
+                                dst_path = resolve_path(file_name, &dst_path);
+                            }
+                            if let Err(e) = vfs_insert(vfs, &dst_path, cloned_node, current_user) {
+                                println!("cp: cannot create regular file '{}': {}", dst_path, e);
+                            }
+                        }
+                    } else {
+                        println!("cp: cannot stat '{}': No such file or directory", src);
+                    }
+                } else {
+                    println!("cp: missing file operand");
+                }
+            }
+            
+            "echo" => {
+                let mut message_words = Vec::new();
+                let mut target_file: Option<String> = None;
+                let mut append_mode = false;
+
+                while let Some(word) = input_parts.next() {
+                    if word == ">" || word == ">>" {
+                        if word == ">>" { append_mode = true; }
+                        target_file = input_parts.next().map(|s| s.to_string());
+                        break;
+                    } else {
+                        message_words.push(word);
+                    }
+                }
+
+                let mut final_message = message_words.join(" ");
+                
+                // If they piped data INTO echo, append it to the message!
+                if let Some(pipe_in) = stdin {
+                    if final_message.is_empty() { final_message = pipe_in; } 
+                    else { final_message = format!("{} {}", final_message, pipe_in); }
+                }
+
+                if let Some(file_name) = target_file {
+                    let full_target_path = resolve_path(&file_name, &cwd);
+                    if let Some(node) = vfs.get_mut(&full_target_path) {
+                        if !node.can_access(current_user) {
+                            println!("echo: {}: Permission denied", file_name);
+                        } else if let VfsNode::File { content, .. } = node {
+                            if append_mode {
+                                content.push_str("\n");
+                                content.push_str(&final_message);
+                            } else {
+                                *content = final_message;
+                            }
+                        } else {
+                            println!("echo: {}: Is a directory", file_name);
+                        }
+                    } else {
+                        let new_file = VfsNode::new_file(final_message, current_user);
+                        if let Err(e) = vfs_insert(vfs, &full_target_path, new_file, current_user) {
+                            println!("echo: cannot create file '{}': {}", file_name, e);
+                        }
+                    }
+                } else {
+                    stdout = Some(final_message); // Send to pipe!
+                }
+            }
+
+            "exit" => return (false, None),
+            
+            "grep" => {
+                let pattern = input_parts.next();
+                let mut target_content = stdin.clone(); // Try reading from the pipe first!
+
+                // If the pipe is empty, try reading the file argument!
+                if target_content.is_none() {
+                    if let Some(file_arg) = input_parts.next() {
+                        let full_path = resolve_path(file_arg, &cwd);
+                        if let Some(node) = vfs.get(&full_path) {
+                            if !node.can_access(current_user) {
+                                println!("grep: {}: Permission denied", file_arg);
+                            } else if let VfsNode::File { content, .. } = node {
+                                target_content = Some(content.clone());
+                            } else {
+                                println!("grep: {}: Is a directory", file_arg);
+                            }
+                        } else {
+                            println!("grep: {}: No such file", file_arg);
+                        }
+                    }
+                }
+
+                // Execute the actual grep logic!
+                if let (Some(p), Some(content)) = (pattern, target_content) {
+                    let mut matches = Vec::new();
+                    for line in content.lines() {
+                        if line.contains(p) {
+                            matches.push(line.to_string());
+                        }
+                    }
+                    stdout = Some(matches.join("\n")); // Send results to the pipe!
+                } else {
+                    println!("usage: grep <pattern> [<file>]");
+                }
+            }
+
+            "help" => {
+                stdout = Some("HELP-MENU:\n  cat, cd, clear, cp, echo, grep, ls, mkdir, mv, pwd, rm, sudo, touch, whoami".to_string());
+            }
+
+            "history" => {
+                let mut hist_out = Vec::new();
+                for (index, cmd) in history.iter().enumerate() {
+                    hist_out.push(format!("  {}  {}", index + 1, cmd));
+                }
+                stdout = Some(hist_out.join("\n"));
+            }
+
+            "ls" => {
+                let target_path = if let Some(arg) = input_parts.next() { resolve_path(arg, &cwd) } else { cwd.clone() };
+                if let Some(node) = vfs.get(&target_path) {
+                    if !node.can_access(current_user) {
+                        println!("ls: cannot open directory '{}': Permission denied", target_path);
+                    } else {
+                        match node {
+                            VfsNode::Directory { children, .. } => stdout = Some(children.join(" ")), // Send to pipe!
+                            VfsNode::File { .. } => {
+                                let file_name = target_path.rsplit_once('/').map(|(_, name)| name).unwrap_or(&target_path);
+                                stdout = Some(file_name.to_string());
+                            }
+                        }
+                    }
+                } else {
+                    println!("ls: cannot access '{}': No such file or directory", target_path);
+                }
+            }
+
+            "mkdir" => { /* identical ... */ 
+                if let Some(folder_name) = input_parts.next() {
+                    let full_target_path = resolve_path(folder_name, &cwd);
+                    let new_folder = VfsNode::new_dir(current_user);
+                    if let Err(e) = vfs_insert(vfs, &full_target_path, new_folder, current_user) {
+                        println!("mkdir: cannot create directory '{}': {}", full_target_path, e);
+                    }
+                } else {
+                    println!("mkdir: missing operand");
+                }
+            }
+
+            "mv" => { /* identical ... */ 
+                let source_arg = input_parts.next();
+                let dest_arg = input_parts.next();
+                if let (Some(src), Some(dst)) = (source_arg, dest_arg) {
+                    let src_path = resolve_path(src, &cwd);
+                    let mut dst_path = resolve_path(dst, &cwd);
+                    if let Some(VfsNode::Directory { .. }) = vfs.get(&dst_path) {
+                        let file_name = src_path.rsplit_once('/').map(|(_, name)| name).unwrap_or(&src_path);
+                        dst_path = resolve_path(file_name, &dst_path);
+                    }
+                    match vfs_remove(vfs, &src_path, current_user) {
+                        Ok(src_node) => {
+                            if let Err(e) = vfs_insert(vfs, &dst_path, src_node.clone(), current_user) {
+                                let _ = vfs_insert(vfs, &src_path, src_node, "root");
+                                println!("mv: cannot move to '{}': {}", dst_path, e);
+                            }
+                        }
+                        Err(e) => println!("mv: cannot stat '{}': {}", src, e),
+                    }
+                } else {
+                    println!("mv: missing file operand");
+                }
+            }
+
+            "pwd" => stdout = Some(cwd.clone()), // Send to pipe!
+
+            "rm" => { /* identical ... */ 
+                if let Some(file_name) = input_parts.next() {
+                    let full_target_path = resolve_path(file_name, &cwd);
+                    if let Some(VfsNode::Directory { .. }) = vfs.get(&full_target_path) {
+                        println!("rm: cannot remove '{}': Is a directory", file_name);
+                    } else {
+                        match vfs_remove(vfs, &full_target_path, current_user) {
+                            Ok(_) => {} 
+                            Err(e) => println!("rm: cannot remove '{}': {}", file_name, e),
+                        }
+                    }
+                } else {
+                    println!("rm: missing operand");
+                }
+            }
+
+            "sudo" => {
+                let remaining_cmd: Vec<&str> = input_parts.collect();
+                if remaining_cmd.is_empty() {
+                    println!("usage: sudo <command>");
+                } else {
+                    let old_user = current_user.clone();
+                    *current_user = String::from("root");
+                    let full_cmd = remaining_cmd.join(" ");
+                    
+                    // Pass the pipe data into sudo, and grab what comes out!
+                    let (_, out) = execute_command(&full_cmd, cwd, vfs, history, current_user, stdin);
+                    stdout = out; 
+                    
+                    *current_user = old_user;
+                }
+            }
+
+            "touch" => { /* identical ... */ 
+                if let Some(file_name) = input_parts.next() {
+                    let full_file_path = resolve_path(file_name, &cwd);
+                    if !vfs.contains_key(&full_file_path) {
+                        let new_file = VfsNode::new_file(String::new(), current_user);
+                        if let Err(e) = vfs_insert(vfs, &full_file_path, new_file, current_user) {
+                            println!("touch: cannot touch '{}': {}", file_name, e);
+                        }
+                    }
+                } else {
+                    println!("touch: missing file operand");
+                }
+            }
+
+            "whoami" => stdout = Some(current_user.clone()), // Send to pipe!
+
+            _ => println!("Command {} not found!", cmd),
+        }
+    }
+
+    (true, stdout) // Return the state AND the pipe data!
+}
+
+// Universally handles inserting a node, updating the parent, AND checking permissions!
+fn vfs_insert(
+    vfs: &mut HashMap<String, VfsNode>,
+    full_path: &str,
+    node: VfsNode,
+    current_user: &str,
+) -> Result<(), &'static str> {
+    if let Some((parent_path, file_name)) = full_path.rsplit_once('/') {
+        let actual_parent = if parent_path == "" { "/" } else { parent_path };
+
+        if let Some(parent_node) = vfs.get_mut(actual_parent) {
+            // PERMISSION CHECK ON THE PARENT FOLDER!
+            if !parent_node.can_access(current_user) {
+                return Err("Permission denied");
+            }
+            if let VfsNode::Directory { children, .. } = parent_node {
+                if !children.contains(&file_name.to_string()) {
+                    children.push(file_name.to_string());
+                }
+            } else {
+                return Err("Not a directory");
+            }
+        } else {
+            return Err("No such parent directory");
+        }
+
+        vfs.insert(full_path.to_string(), node);
+        return Ok(());
+    }
+    Err("Invalid path")
+}
+
+// Universally handles removing a node, cleaning the parent, AND checking permissions!
+fn vfs_remove(
+    vfs: &mut HashMap<String, VfsNode>,
+    full_path: &str,
+    current_user: &str,
+) -> Result<VfsNode, &'static str> {
+    // 1. Check if the target file itself exists and can be accessed
+    let node = match vfs.get(full_path) {
+        Some(n) => n,
+        None => return Err("No such file or directory"),
+    };
+
+    if !node.can_access(current_user) {
+        return Err("Permission denied");
+    }
+
+    if let Some((parent_path, file_name)) = full_path.rsplit_once('/') {
+        let actual_parent = if parent_path == "" { "/" } else { parent_path };
+
+        // 2. Remove from parent's children list (Must also have access to parent!)
+        if let Some(parent_node) = vfs.get_mut(actual_parent) {
+            if !parent_node.can_access(current_user) {
+                return Err("Permission denied on parent directory");
+            }
+            if let VfsNode::Directory { children, .. } = parent_node {
+                children.retain(|child| child != file_name);
+            }
+        }
+    }
+
+    // 3. Rip out of dictionary
+    Ok(vfs.remove(full_path).unwrap())
+}
+
+fn resolve_path(target: &str, cwd: &str) -> String {
+    // 1. Build the raw absolute path string
+    let raw_path = if target.starts_with("/") {
+        target.to_string()
+    } else if target == "~" {
+        "/home/user".to_string()
+    } else if cwd == "/" {
+        format!("/{}", target)
+    } else {
+        format!("{}/{}", cwd, target)
+    };
+
+    // 2. The Canonicalization Engine!
+    let mut segments = Vec::new();
+
+    for segment in raw_path.split('/') {
+        if segment == "" || segment == "." {
+            // Ignore empty splits (from double slashes like //) and current dir (.)
+            continue;
+        } else if segment == ".." {
+            // The magic of `..`: pop the last folder off the stack!
+            segments.pop();
+        } else {
+            // A normal folder name: push it onto the stack!
+            segments.push(segment);
+        }
+    }
+
+    // 3. Rebuild the final path from our resolved stack
+    let final_path = format!("/{}", segments.join("/"));
+
+    // 4. Return it! (Our new engine naturally prevents trailing slashes,
+    // so we don't even need the old sanitizer logic anymore!)
+    final_path
+}
