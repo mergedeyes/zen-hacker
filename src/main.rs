@@ -41,6 +41,14 @@ impl VfsNode {
     }
 }
 
+let mut saved_aliases: HashMap<String, String> = if let Ok(data) = fs::read_to_string("aliases.json") {
+    serde_json::from_str(&data).unwrap_or_else(|_| HashMap::new())
+} else {
+    let mut default = HashMap::new();
+    default.insert("please".to_string(), "sudo".to_string());
+    default
+};
+
 // THE MOTHERBOARD: All OS state lives here now!
 struct ZenOS {
     cwd: String,
