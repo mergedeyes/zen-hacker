@@ -41,21 +41,13 @@ impl VfsNode {
     }
 }
 
-let mut saved_aliases: HashMap<String, String> = if let Ok(data) = fs::read_to_string("aliases.json") {
-    serde_json::from_str(&data).unwrap_or_else(|_| HashMap::new())
-} else {
-    let mut default = HashMap::new();
-    default.insert("please".to_string(), "sudo".to_string());
-    default
-};
-
 // THE MOTHERBOARD: All OS state lives here now!
 struct ZenOS {
     cwd: String,
     current_user: String,
     vfs: HashMap<String, VfsNode>,
     history: Vec<String>,
-    aliases: saved_aliases,
+    aliases: HashMap<String, String>,
 }
 
 // ==========================================
@@ -103,7 +95,6 @@ fn cmd_alias(args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, _reg: &Has
         let alias_def = args.join(" ");
         if let Some((name, value)) = alias_def.split_once('=') {
             os.aliases.insert(name.trim().to_string(), value.trim().to_string());
-            // PERSISTENCE MAGIC: Save to disk immediately
             if let Ok(json) = serde_json::to_string_pretty(&os.aliases) {
                 let _ = fs::write("aliases.json", json);
             }
@@ -632,16 +623,21 @@ fn main() {
         }
     }
 
-    let mut default_aliases = HashMap::new();
-    default_aliases.insert("please".to_string(), "sudo".to_string()); // Default easter egg alias!
+    // Replace your alias initialization with this:
+    let mut saved_aliases: HashMap<String, String> = if let Ok(data) = fs::read_to_string("aliases.json") {
+        serde_json::from_str(&data).unwrap_or_else(|_| HashMap::new())
+    } else {
+        let mut default = HashMap::new();
+        default.insert("please".to_string(), "sudo".to_string());
+        default
+    };
 
-    // Initialize our Motherboard State
     let mut os = ZenOS {
         cwd: String::from("/home/user"),
         current_user: String::from("user"),
         vfs: initial_vfs,
         history: history_list,
-        aliases: default_aliases,
+        aliases: saved_aliases, // Use the loaded aliases here
     };
 
     let registry = build_registry();
