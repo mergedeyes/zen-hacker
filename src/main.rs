@@ -47,7 +47,7 @@ struct ZenOS {
     current_user: String,
     vfs: HashMap<String, VfsNode>,
     history: Vec<String>,
-    aliases: HashMap<String, String>,
+    aliases: saved_aliases,
 }
 
 // ==========================================
@@ -95,6 +95,10 @@ fn cmd_alias(args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, _reg: &Has
         let alias_def = args.join(" ");
         if let Some((name, value)) = alias_def.split_once('=') {
             os.aliases.insert(name.trim().to_string(), value.trim().to_string());
+            // PERSISTENCE MAGIC: Save to disk immediately
+            if let Ok(json) = serde_json::to_string_pretty(&os.aliases) {
+                let _ = fs::write("aliases.json", json);
+            }
         } else {
             println!("alias: usage: alias name=value");
         }

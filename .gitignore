@@ -4,3 +4,5 @@
 vfs_data.json
 *.sublime-project
 *.sublime-workspace
+aliases.json
+
