@@ -1,5 +1,5 @@
 /target
-*.bak
+*.bak*
 .zen_history
 vfs_data.json
 *.sublime-project
