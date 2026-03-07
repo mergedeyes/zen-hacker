@@ -12,6 +12,10 @@ use std::io::Write;
 use std::thread;
 use std::time::Duration;
 use std::net::Ipv4Addr;
+use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::event::{read, Event, KeyCode, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
+use crossterm::execute;
 
 // ==========================================
 // 1. CORE DATA STRUCTURES
@@ -54,39 +58,213 @@ struct ZenOS {
 // 2. THE COMMAND REGISTRY PATTERN
 // ==========================================
 
-// We wrap the function pointer in a Struct to break the infinite type cycle!
-#[derive(Clone, Copy)]
-struct CommandFn(pub fn(Vec<&str>, &mut ZenOS, Option<String>, &HashMap<String, CommandFn>) -> (bool, Option<String>));
+#[derive(Clone)]
+struct CommandFn {
+    func: fn(Vec<&str>, &mut ZenOS, Option<String>, &HashMap<String, CommandFn>) -> (bool, Option<String>),
+    help: &'static str,
+}
 
 fn build_registry() -> HashMap<String, CommandFn> {
     let mut reg: HashMap<String, CommandFn> = HashMap::new();
-    reg.insert("alias".to_string(), CommandFn(cmd_alias));
-    reg.insert("cat".to_string(), CommandFn(cmd_cat));
-    reg.insert("cd".to_string(), CommandFn(cmd_cd));
-    reg.insert("clear".to_string(), CommandFn(cmd_clear));
-    reg.insert("cp".to_string(), CommandFn(cmd_cp));
-    reg.insert("echo".to_string(), CommandFn(cmd_echo));
-    reg.insert("exit".to_string(), CommandFn(cmd_exit));
-    reg.insert("grep".to_string(), CommandFn(cmd_grep));
-    reg.insert("help".to_string(), CommandFn(cmd_help));
-    reg.insert("history".to_string(), CommandFn(cmd_history));
-    reg.insert("ls".to_string(), CommandFn(cmd_ls));
-    reg.insert("mkdir".to_string(), CommandFn(cmd_mkdir));
-    reg.insert("mv".to_string(), CommandFn(cmd_mv));
-    reg.insert("ping".to_string(), CommandFn(cmd_ping));
-    reg.insert("pwd".to_string(), CommandFn(cmd_pwd));
-    reg.insert("rm".to_string(), CommandFn(cmd_rm));
-    reg.insert("sudo".to_string(), CommandFn(cmd_sudo));
-    reg.insert("touch".to_string(), CommandFn(cmd_touch));
-    reg.insert("whoami".to_string(), CommandFn(cmd_whoami));
+    
+    // Notice how we map the function AND its help text in one place!
+    reg.insert("alias".to_string(), CommandFn { func: cmd_alias, help: "alias [name=value]\n    View or create command aliases." });
+    reg.insert("cat".to_string(), CommandFn { func: cmd_cat, help: "cat <file>\n    Print the contents of a file to standard output." });
+    reg.insert("cd".to_string(), CommandFn { func: cmd_cd, help: "cd <path>\n    Change the current working directory." });
+    reg.insert("clear".to_string(), CommandFn { func: cmd_clear, help: "clear\n    Clear the terminal screen." });
+    reg.insert("cp".to_string(), CommandFn { func: cmd_cp, help: "cp <src> <dst>\n    Copy a file to a new location." });
+    reg.insert("echo".to_string(), CommandFn { func: cmd_echo, help: "echo <text> [> file]\n    Print text to standard output or redirect to a file." });
+    reg.insert("exit".to_string(), CommandFn { func: cmd_exit, help: "exit\n    Close the Zen-OS terminal." });
+    reg.insert("grep".to_string(), CommandFn { func: cmd_grep, help: "grep <pattern> <file>\n    Search for a pattern in a file or piped input." });
+    reg.insert("help".to_string(), CommandFn { func: cmd_help, help: "help [command]\n    Display the help menu or information about a specific command.\n    Did you really need a help for help? :P" });
+    reg.insert("history".to_string(), CommandFn { func: cmd_history, help: "history\n    View the list of previously executed commands." });
+    reg.insert("import".to_string(), CommandFn { func: cmd_import, help: "import <real_path> <zen_path>\n    Import a file from the host operating system into Zen-OS." });
+    reg.insert("ls".to_string(), CommandFn { func: cmd_ls, help: "ls [path]\n    List directory contents." });
+    reg.insert("mkdir".to_string(), CommandFn { func: cmd_mkdir, help: "mkdir <name>\n    Create a new directory." });
+    reg.insert("mv".to_string(), CommandFn { func: cmd_mv, help: "mv <src> <dst>\n    Move or rename a file." });
+    reg.insert("nano".to_string(), CommandFn { func: cmd_nano, help: "nano <file>\n    Open the Zen-Nano text editor." });
+    reg.insert("ping".to_string(), CommandFn { func: cmd_ping, help: "ping <ip_address>\n    Send ICMP ECHO_REQUEST to network hosts." });
+    reg.insert("pwd".to_string(), CommandFn { func: cmd_pwd, help: "pwd\n    Print name of current/working directory." });
+    reg.insert("rm".to_string(), CommandFn { func: cmd_rm, help: "rm <file>\n    Remove a file." });
+    reg.insert("sudo".to_string(), CommandFn { func: cmd_sudo, help: "sudo <command>\n    Execute a command as the root user." });
+    reg.insert("touch".to_string(), CommandFn { func: cmd_touch, help: "touch <file>\n    Create an empty file or update its timestamp." });
+    reg.insert("whoami".to_string(), CommandFn { func: cmd_whoami, help: "whoami\n    Print the current user ID." });
+    
     reg
 }
 
 // ==========================================
 // 3. COMMAND FUNCTIONS
 // ==========================================
+fn cmd_import(mut args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, _reg: &HashMap<String, CommandFn>) -> (bool, Option<String>) {
+    if args.len() < 2 {
+        println!("import: usage: import <real_os_path> <zen_os_path>");
+        return (true, None);
+    }
+    let real_path = args.remove(0);
+    let zen_path = resolve_path(args.remove(0), &os.cwd);
+    
+    // Read from the REAL hard drive!
+    match fs::read_to_string(real_path) {
+        Ok(content) => {
+            let new_file = VfsNode::new_file(content, &os.current_user);
+            if let Err(e) = vfs_insert(&mut os.vfs, &zen_path, new_file, &os.current_user) {
+                println!("import: failed to save to VFS: {}", e);
+            } else {
+                println!("Successfully imported '{}' into ZenOS at '{}'", real_path, zen_path);
+            }
+        }
+        Err(e) => println!("import: could not read real file '{}': {}", real_path, e),
+    }
+    (true, None)
+}
 
-fn cmd_alias(args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, _reg: &HashMap<String, CommandFn>) -> (bool, Option<String>) {
+fn cmd_nano(mut args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, _reg: &HashMap<String, CommandFn>) -> (bool, Option<String>) {
+    if args.is_empty() {
+        println!("nano: missing filename");
+        return (true, None);
+    }
+
+    let file_name = args.remove(0);
+    let full_path = resolve_path(file_name, &os.cwd);
+
+    let mut content = String::new();
+    if let Some(node) = os.vfs.get(&full_path) {
+        if !node.can_access(&os.current_user) {
+            println!("nano: {}: Permission denied", file_name);
+            return (true, None);
+        }
+        if let VfsNode::File { content: c, .. } = node {
+            content = c.clone();
+        } else {
+            println!("nano: '{}' is a directory", file_name);
+            return (true, None);
+        }
+    }
+
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    if lines.is_empty() { lines.push(String::new()); }
+
+    let mut cx = 0; 
+    let mut cy = 0;
+    let mut cut_buffer = String::new(); // <--- NEW: The clipboard for Ctrl+K!
+
+    enable_raw_mode().unwrap();
+    let mut stdout = std::io::stdout();
+
+    loop {
+        // 1. Render the UI
+        execute!(stdout, Hide, Clear(ClearType::All)).unwrap();
+        
+        for (i, line) in lines.iter().enumerate() {
+            execute!(stdout, MoveTo(0, i as u16)).unwrap();
+            print!("{}", line);
+        }
+        
+        // Render Status Bar (Now with Cut/Paste!)
+        execute!(stdout, MoveTo(0, (lines.len() + 1) as u16)).unwrap();
+        print!("  ^X Exit  |  ^C Cancel  |  ^K Cut Line  |  ^U Paste Line");
+
+        execute!(stdout, MoveTo(cx as u16, cy as u16), Show).unwrap();
+        stdout.flush().unwrap();
+
+        // 2. Listen for Raw Keystrokes
+        if let Event::Key(key) = read().unwrap() {
+            
+            // --- CONTROL KEY COMBOS ---
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('x') => break, // Exit & Save
+                    KeyCode::Char('c') => {      // Cancel
+                        disable_raw_mode().unwrap();
+                        println!("\r\nAction cancelled.");
+                        return (true, None);
+                    },
+                    KeyCode::Char('k') => {      // Cut Line
+                        if lines.len() > 1 {
+                            cut_buffer = lines.remove(cy);
+                            if cy >= lines.len() { cy = lines.len() - 1; }
+                            cx = cx.min(lines[cy].len());
+                        } else {
+                            // If it's the only line, just clear it
+                            cut_buffer = lines[0].clone();
+                            lines[0].clear();
+                            cx = 0;
+                        }
+                    },
+                    KeyCode::Char('u') => {      // Uncut (Paste) Line
+                        if !cut_buffer.is_empty() {
+                            lines.insert(cy, cut_buffer.clone());
+                            cy += 1; // Move cursor down to the next line naturally
+                            cx = 0;
+                        }
+                    },
+                    _ => {}
+                }
+                continue; // Skip the rest of the loop for control combos!
+            }
+
+            // --- NORMAL NAVIGATION & TYPING ---
+            match key.code {
+                KeyCode::Up => {
+                    if cy > 0 { cy -= 1; cx = cx.min(lines[cy].len()); }
+                    else { cx = 0; } // Jump to start if on top line
+                },
+                KeyCode::Down => {
+                    if cy < lines.len() - 1 { cy += 1; cx = cx.min(lines[cy].len()); }
+                    else { cx = lines[cy].len(); } // Jump to end if on bottom line
+                },
+                KeyCode::Left => {
+                    if cx > 0 { cx -= 1; } 
+                    else if cy > 0 { cy -= 1; cx = lines[cy].len(); } // Wrap up to previous line!
+                },
+                KeyCode::Right => {
+                    if cx < lines[cy].len() { cx += 1; } 
+                    else if cy < lines.len() - 1 { cy += 1; cx = 0; } // Wrap down to next line!
+                },
+                KeyCode::Char(c) => { lines[cy].insert(cx, c); cx += 1; },
+                KeyCode::Backspace => {
+                    if cx > 0 {
+                        cx -= 1;
+                        lines[cy].remove(cx);
+                    } else if cy > 0 {
+                        let prev_len = lines[cy - 1].len();
+                        let curr_line = lines.remove(cy);
+                        cy -= 1;
+                        cx = prev_len;
+                        lines[cy].push_str(&curr_line);
+                    }
+                },
+                KeyCode::Enter => {
+                    let split = lines[cy].split_off(cx);
+                    lines.insert(cy + 1, split);
+                    cy += 1;
+                    cx = 0;
+                },
+                _ => {}
+            }
+        }
+    }
+
+    // 3. Save the File
+    disable_raw_mode().unwrap();
+    println!("\r"); // Move past the status bar so the shell prompt is clean
+
+    let final_content = lines.join("\n");
+    let new_file = VfsNode::new_file(final_content, &os.current_user);
+    if let Err(e) = vfs_insert(&mut os.vfs, &full_path, new_file, &os.current_user) {
+        println!("nano: error saving file: {}", e);
+    } else {
+        if let Ok(json_data) = serde_json::to_string_pretty(&os.vfs) {
+            let _ = fs::write("vfs_data.json", json_data);
+        }
+        println!("Saved changes to {}", file_name);
+    }
+
+    (true, None)
+}
+
+fn cmd_alias(args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, reg: &HashMap<String, CommandFn>) -> (bool, Option<String>) {
     if args.is_empty() {
         let mut out = Vec::new();
         for (k, v) in os.aliases.iter() { out.push(format!("alias {}='{}'", k, v)); }
@@ -94,10 +272,43 @@ fn cmd_alias(args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, _reg: &Has
     } else {
         let alias_def = args.join(" ");
         if let Some((name, value)) = alias_def.split_once('=') {
-            os.aliases.insert(name.trim().to_string(), value.trim().to_string());
-            if let Ok(json) = serde_json::to_string_pretty(&os.aliases) {
-                let _ = fs::write("aliases.json", json);
+            let name = name.trim();
+            let value = value.trim();
+
+            // --- THE SECURITY CHECKS ---
+            if reg.contains_key(name) {
+                println!("alias: '{}' is a system command and cannot be aliased.", name);
+                return (true, None);
             }
+            if os.aliases.contains_key(name) {
+                println!("alias: '{}' already exists as an alias.", name);
+                return (true, None);
+            }
+
+            os.aliases.insert(name.to_string(), value.to_string());
+            
+            // Persist to .zenrc
+            let rc_path = "/home/user/.zenrc";
+            let new_line = format!("alias {}={}", name, value);
+            
+            if let Some(node) = os.vfs.get_mut(rc_path) {
+                if let VfsNode::File { content, .. } = node {
+                    if !content.contains(&new_line) {
+                        content.push_str("\n");
+                        content.push_str(&new_line);
+                    }
+                }
+            } else {
+                let new_rc = VfsNode::new_file(new_line, "user");
+                let _ = vfs_insert(&mut os.vfs, rc_path, new_rc, "root");
+            }
+
+            // FORCE SAVE TO REAL DISK SO IT DOESN'T GET LOST!
+            if let Ok(json_data) = serde_json::to_string_pretty(&os.vfs) {
+                let _ = fs::write("vfs_data.json", json_data);
+            }
+            
+            println!("Alias saved to .zenrc");
         } else {
             println!("alias: usage: alias name=value");
         }
@@ -272,11 +483,22 @@ fn cmd_grep(mut args: Vec<&str>, os: &mut ZenOS, stdin: Option<String>, _reg: &H
     }
 }
 
-fn cmd_help(_args: Vec<&str>, _os: &mut ZenOS, _stdin: Option<String>, reg: &HashMap<String, CommandFn>) -> (bool, Option<String>) {
-    let mut cmds: Vec<String> = reg.keys().cloned().collect();
-    cmds.sort();
-    let help_text = format!("HELP-MENU:\n  {}", cmds.join(", "));
-    (true, Some(help_text))
+fn cmd_help(mut args: Vec<&str>, _os: &mut ZenOS, _stdin: Option<String>, reg: &HashMap<String, CommandFn>) -> (bool, Option<String>) {
+    if args.is_empty() {
+        // Normal behavior: Print the list of all commands
+        let mut cmds: Vec<String> = reg.keys().cloned().collect();
+        cmds.sort();
+        let help_text = format!("HELP-MENU:\n  {}\n\nType '<command> help' or 'help <command>' for more info.", cmds.join("\n  "));
+        (true, Some(help_text))
+    } else {
+        // Advanced behavior: Look up the specific command's help text!
+        let target = args.remove(0);
+        if let Some(cmd) = reg.get(target) {
+            (true, Some(cmd.help.to_string()))
+        } else {
+            (true, Some(format!("help: no help topics match '{}'", target)))
+        }
+    }
 }
 
 fn cmd_history(_args: Vec<&str>, os: &mut ZenOS, _stdin: Option<String>, _reg: &HashMap<String, CommandFn>) -> (bool, Option<String>) {
@@ -463,8 +685,14 @@ fn execute_command(
     // DISPATCH TO REGISTRY
     if let Some(command_function) = registry.get(cmd_name) {
         let args: Vec<&str> = parts.collect();
-        // Notice the `.0` here to unwrap the struct!
-        return command_function.0(args, os, stdin, registry); 
+        
+        // --- THE UNIVERSAL HELP INTERCEPTOR ---
+        if args.len() == 1 && (args[0] == "help" || args[0] == "--help") {
+            return (true, Some(command_function.help.to_string()));
+        }
+
+        // We run `.func` because we changed the struct!
+        return (command_function.func)(args, os, stdin, registry); 
     } else {
         println!("Command {} not found!", cmd_name);
         (true, None)
@@ -535,38 +763,81 @@ struct ZenHelper {
 
 impl Completer for ZenHelper {
     type Candidate = Pair;
+
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> rustyline::Result<(usize, Vec<Pair>)> {
         let mut candidates = Vec::new();
         let word_start = line[..pos].rfind(' ').map(|i| i + 1).unwrap_or(0);
         let word_to_complete = &line[word_start..pos];
 
-        for cmd in &self.commands {
-            if cmd.starts_with(word_to_complete) {
-                candidates.push(Pair { display: cmd.to_string(), replacement: cmd.to_string() });
+        let is_command = word_start == 0;
+
+        if is_command {
+            for cmd in &self.commands {
+                if cmd.starts_with(word_to_complete) {
+                    candidates.push(Pair {
+                        display: cmd.to_string(),
+                        replacement: cmd.to_string(),
+                    });
+                }
             }
-        }
+        } else {
+            let is_absolute = word_to_complete.starts_with('/');
+            
+            // Split word into the directory path and the partial file/folder name
+            let (dir_part, partial_name) = match word_to_complete.rfind('/') {
+                Some(idx) => (&word_to_complete[..=idx], &word_to_complete[idx + 1..]),
+                None => ("", word_to_complete),
+            };
 
-        let is_absolute = word_to_complete.starts_with('/');
-        let search_prefix = if is_absolute { word_to_complete.to_string() } 
-        else if self.cwd == "/" { format!("/{}", word_to_complete) } 
-        else { format!("{}/{}", self.cwd, word_to_complete) };
+            // Build the absolute path to search inside
+            let mut search_prefix = if is_absolute {
+                dir_part.to_string()
+            } else if self.cwd == "/" {
+                format!("/{}", dir_part)
+            } else {
+                format!("{}/{}", self.cwd, dir_part)
+            };
 
-        for path in &self.vfs_paths {
-            if path.starts_with(&search_prefix) && path != &self.cwd {
-                let replacement = if is_absolute { path.clone() } else {
-                    let prefix_len = if self.cwd == "/" { 1 } else { self.cwd.len() + 1 };
-                    if path.len() > prefix_len { path[prefix_len..].to_string() } else { continue; }
-                };
+            // Ensure search_prefix ends with a slash so we can cleanly chop it off
+            if !search_prefix.ends_with('/') {
+                search_prefix.push('/');
+            }
+            while search_prefix.contains("//") {
+                search_prefix = search_prefix.replace("//", "/");
+            }
 
-                let final_replacement = if let Some(slash_idx) = replacement[word_to_complete.len()..].find('/') {
-                    replacement[..word_to_complete.len() + slash_idx + 1].to_string()
-                } else { replacement };
+            for path in &self.vfs_paths {
+                // Skip the exact directory we are searching inside
+                if path == &search_prefix { continue; }
 
-                if !candidates.iter().any(|c| c.replacement == final_replacement) {
-                    candidates.push(Pair { display: final_replacement.clone(), replacement: final_replacement });
+                if path.starts_with(&search_prefix) {
+                    let remainder = &path[search_prefix.len()..];
+                    
+                    // Isolate ONLY the very next segment (stop cycling deep folders!)
+                    let segment_end = match remainder.find('/') {
+                        Some(idx) => idx + 1, // Include the slash to indicate it's a directory
+                        None => remainder.len(),
+                    };
+                    
+                    let segment = &remainder[..segment_end];
+                    let clean_segment = segment.trim_end_matches('/');
+
+                    if clean_segment.starts_with(partial_name) {
+                        // The replacement is what you originally typed + the completed segment
+                        let replacement = format!("{}{}", dir_part, segment);
+                        
+                        // Prevent duplicates (e.g., 5 files in a folder just show the folder ONCE)
+                        if !candidates.iter().any(|c| c.replacement == replacement) {
+                            candidates.push(Pair {
+                                display: segment.to_string(), // Only show the segment on screen
+                                replacement, 
+                            });
+                        }
+                    }
                 }
             }
         }
+
         Ok((word_start, candidates))
     }
 }
@@ -584,7 +855,7 @@ impl Helper for ZenHelper {}
 // ==========================================
 
 fn main() {
-    let mut initial_vfs: HashMap<String, VfsNode> = if let Ok(saved_data) = fs::read_to_string("vfs_data.json") {
+    let initial_vfs: HashMap<String, VfsNode> = if let Ok(saved_data) = fs::read_to_string("vfs_data.json") {
         match serde_json::from_str(&saved_data) {
             Ok(valid_vfs) => valid_vfs,
             Err(_) => {
@@ -623,14 +894,8 @@ fn main() {
         }
     }
 
-    // Replace your alias initialization with this:
-    let mut saved_aliases: HashMap<String, String> = if let Ok(data) = fs::read_to_string("aliases.json") {
-        serde_json::from_str(&data).unwrap_or_else(|_| HashMap::new())
-    } else {
-        let mut default = HashMap::new();
-        default.insert("please".to_string(), "sudo".to_string());
-        default
-    };
+    let mut saved_aliases = HashMap::new();
+    saved_aliases.insert("please".to_string(), "sudo".to_string());
 
     let mut os = ZenOS {
         cwd: String::from("/home/user"),
@@ -674,7 +939,17 @@ fn main() {
     // Main Shell Loop
     loop {
         if let Some(helper) = rl.helper_mut() {
-            helper.vfs_paths = os.vfs.keys().cloned().collect();
+            // 1. Identify Directories vs Files for the Autocomplete!
+            let mut paths = Vec::new();
+            for (p, node) in os.vfs.iter() {
+                if let VfsNode::Directory { .. } = node {
+                    if p == "/" { paths.push(p.clone()); }
+                    else { paths.push(format!("{}/", p)); } // Add trailing slash to dirs!
+                } else {
+                    paths.push(p.clone());
+                }
+            }
+            helper.vfs_paths = paths;
             helper.cwd = os.cwd.clone();
             
             // Dynamic Autocomplete updating!
